@@ -200,6 +200,28 @@ static void launch_gated_delta_net(
     }
 }
 
+// Forward decl: alternative kernel implemented in gated_delta_net_v2.cu.
+// Selected at runtime via the GGML_GDN_AR_V2 environment variable.
+template <bool KDA>
+void launch_gated_delta_net_v2(
+        const float * q_d, const float * k_d, const float * v_d,
+        const float * g_d, const float * b_d, const float * s_d,
+        float * dst_d,
+        int64_t S_v,   int64_t H, int64_t n_tokens, int64_t n_seqs,
+        int64_t sq1,   int64_t sq2, int64_t sq3,
+        int64_t sv1,   int64_t sv2, int64_t sv3,
+        int64_t sb1,   int64_t sb2, int64_t sb3,
+        int64_t neqk1, int64_t rq3,
+        float scale, cudaStream_t stream);
+
+static bool gdn_ar_v2_enabled() {
+    static const bool v = []() {
+        const char * e = std::getenv("GGML_GDN_AR_V2");
+        return e && std::atoi(e) != 0;
+    }();
+    return v;
+}
+
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_tensor * src_q     = dst->src[0];
     ggml_tensor * src_k     = dst->src[1];
@@ -261,13 +283,28 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     cudaStream_t stream = ctx.stream();
 
-    if (kda) {
-        launch_gated_delta_net<true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
-            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1, rq3, scale, stream);
+    // v2 supports S_v in {16, 32, 64, 128, 256}
+    const bool use_v2 = gdn_ar_v2_enabled() && (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128 || S_v == 256);
+
+    if (use_v2) {
+        if (kda) {
+            launch_gated_delta_net_v2<true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1, rq3, scale, stream);
+        } else {
+            launch_gated_delta_net_v2<false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1, rq3, scale, stream);
+        }
     } else {
-        launch_gated_delta_net<false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
-            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1, rq3, scale, stream);
+        if (kda) {
+            launch_gated_delta_net<true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1, rq3, scale, stream);
+        } else {
+            launch_gated_delta_net<false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1, rq3, scale, stream);
+        }
     }
 }

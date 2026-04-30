@@ -116,6 +116,10 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+# standalone benchmark for the fused Gated Delta Net AR CUDA kernel
+# (see tests/bench_gdn_ar.cpp for details). Not registered as a ctest.
+llama_build(bench_gdn_ar.cpp)
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 
