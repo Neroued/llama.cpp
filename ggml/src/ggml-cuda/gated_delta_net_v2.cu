@@ -28,19 +28,6 @@ template <int n> static __device__ __forceinline__ void vec_store(float * ptr, c
     }
 }
 
-template <int n> static __device__ __forceinline__ void vec_zero(float (&reg)[n]) {
-    if constexpr (n == 4) {
-        *reinterpret_cast<float4 *>(&reg[0]) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    } else if constexpr (n == 2) {
-        *reinterpret_cast<float2 *>(&reg[0]) = make_float2(0.0f, 0.0f);
-    } else if constexpr (n == 8) {
-        *reinterpret_cast<float4 *>(&reg[0]) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        *reinterpret_cast<float4 *>(&reg[4]) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    } else {
-        reg[0] = 0.0f;
-    }
-}
-
 constexpr int d_v_per_warp = 4;
 constexpr int num_warps    = 4;
 constexpr int block_dv     = num_warps * d_v_per_warp;  // 16
@@ -72,19 +59,16 @@ __global__ void __launch_bounds__(ggml_cuda_get_physical_warp_size() * num_warps
     constexpr int warp_size     = ggml_cuda_get_physical_warp_size();
     constexpr int active_lanes  = (S_v < warp_size) ? S_v : warp_size;
     constexpr int d_qk_per_lane = S_v / active_lanes;
-    static_assert(d_qk_per_lane >= 1, "v2 requires S_v >= 1");
+    static_assert(d_qk_per_lane >= 1, "S_v must >= 1");
     static_assert(S_v % active_lanes == 0, "S_v must be a multiple of active_lanes");
+    static_assert(S_v % block_dv == 0, "S_v must be a multiple of block_dv");
 
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     const int      lane     = threadIdx.x;
     const int      warp_id  = threadIdx.y;
 
-    const uint32_t dv_base = blockIdx.z * block_dv + warp_id * d_v_per_warp;
-    if (dv_base >= S_v) {
-        return;
-    }
-
+    const uint32_t dv_base  = blockIdx.z * block_dv + warp_id * d_v_per_warp;
     const uint32_t dqk_base = lane * d_qk_per_lane;
 
     const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
@@ -100,38 +84,33 @@ __global__ void __launch_bounds__(ggml_cuda_get_physical_warp_size() * num_warps
     curr_state += state_off;
     attn_data += ((int64_t) sequence * n_tokens * H + h_idx) * S_v;
 
-    // Load state into register tile: d_v_per_warp rows x d_qk_per_lane columns
+    auto load_qk_lane = [&] __device__(float(&reg)[d_qk_per_lane], const float * base) {
+        if constexpr (S_v < warp_size) {
+            reg[0] = (lane < active_lanes) ? base[lane] : 0.0f;
+        } else {
+            vec_load<d_qk_per_lane>(reg, base + dqk_base);
+        }
+    };
+    auto store_qk_lane = [&] __device__(const float(&reg)[d_qk_per_lane], float * base) {
+        if constexpr (S_v < warp_size) {
+            if (lane < active_lanes) {
+                base[lane] = reg[0];
+            }
+        } else {
+            vec_store<d_qk_per_lane>(base + dqk_base, reg);
+        }
+    };
+
+    // state is stored transposed
     float s_tile[d_v_per_warp][d_qk_per_lane];
 
 #pragma unroll
     for (int r = 0; r < d_v_per_warp; ++r) {
-        const uint32_t dv    = dv_base + r;
-        const float *  row   = curr_state + (int64_t) dv * S_v + dqk_base;
-        bool           valid = (dv < S_v);
-        if constexpr (S_v < warp_size) {
-            valid = valid && (lane < active_lanes);
-        }
-        if (valid) {
-            vec_load<d_qk_per_lane>(s_tile[r], row);
-        } else {
-            vec_zero<d_qk_per_lane>(s_tile[r]);
-        }
+        load_qk_lane(s_tile[r], curr_state + (int64_t) (dv_base + r) * S_v);
     }
 
-    // Prefetch k for t=0
     float k_reg[d_qk_per_lane];
-    {
-        const float * k_t = k + (int64_t) iq3 * sq3 + (int64_t) iq1 * sq1;
-        if constexpr (S_v < warp_size) {
-            if (lane < active_lanes) {
-                k_reg[0] = k_t[lane];
-            } else {
-                k_reg[0] = 0.0f;
-            }
-        } else {
-            vec_load<d_qk_per_lane>(k_reg, &k_t[dqk_base]);
-        }
-    }
+    load_qk_lane(k_reg, k + (int64_t) iq3 * sq3 + (int64_t) iq1 * sq1);
 
     for (int t = 0; t < n_tokens; ++t) {
         const float * v_t = v + (int64_t) sequence * sv3 + (int64_t) t * sv2 + (int64_t) h_idx * sv1;
@@ -139,21 +118,11 @@ __global__ void __launch_bounds__(ggml_cuda_get_physical_warp_size() * num_warps
         const int64_t gb_off   = (int64_t) sequence * sb3 + (int64_t) t * sb2 + (int64_t) h_idx * sb1;
         const float   beta_val = beta[gb_off];
 
-        // alpha: KDA -> per-lane vector, non-KDA -> warp-wide scalar
         float alpha_lane[d_qk_per_lane];
         float alpha_scalar = 0.0f;
         if constexpr (KDA) {
-            const float * g_t = g + gb_off * S_v;
-            float         g_reg[d_qk_per_lane];
-            if constexpr (S_v < warp_size) {
-                if (lane < active_lanes) {
-                    g_reg[0] = g_t[lane];
-                } else {
-                    g_reg[0] = 0.0f;
-                }
-            } else {
-                vec_load<d_qk_per_lane>(g_reg, &g_t[dqk_base]);
-            }
+            float g_reg[d_qk_per_lane];
+            load_qk_lane(g_reg, g + gb_off * S_v);
 #pragma unroll
             for (int c = 0; c < d_qk_per_lane; ++c) {
                 alpha_lane[c] = expf(g_reg[c]);
@@ -163,7 +132,7 @@ __global__ void __launch_bounds__(ggml_cuda_get_physical_warp_size() * num_warps
         }
 
         float v_local = 0.0f;
-        if (lane < d_v_per_warp && dv_base + lane < S_v) {
+        if (lane < d_v_per_warp) {
             v_local = v_t[dv_base + lane];
         }
 
@@ -193,32 +162,13 @@ __global__ void __launch_bounds__(ggml_cuda_get_physical_warp_size() * num_warps
             }
         }
 
-        // Prefetch k for next token
+        // prefetch k
         if (t + 1 < n_tokens) {
-            const float * k_t1 = k + (int64_t) iq3 * sq3 + (int64_t) (t + 1) * sq2 + (int64_t) iq1 * sq1;
-            if constexpr (S_v < warp_size) {
-                if (lane < active_lanes) {
-                    k_reg[0] = k_t1[lane];
-                } else {
-                    k_reg[0] = 0.0f;
-                }
-            } else {
-                vec_load<d_qk_per_lane>(k_reg, &k_t1[dqk_base]);
-            }
+            load_qk_lane(k_reg, k + (int64_t) iq3 * sq3 + (int64_t) (t + 1) * sq2 + (int64_t) iq1 * sq1);
         }
 
-        // Stage B: attention output
-        const float * q_t = q + (int64_t) iq3 * sq3 + (int64_t) t * sq2 + (int64_t) iq1 * sq1;
-        float         q_reg[d_qk_per_lane];
-        if constexpr (S_v < warp_size) {
-            if (lane < active_lanes) {
-                q_reg[0] = q_t[lane];
-            } else {
-                q_reg[0] = 0.0f;
-            }
-        } else {
-            vec_load<d_qk_per_lane>(q_reg, &q_t[dqk_base]);
-        }
+        float q_reg[d_qk_per_lane];
+        load_qk_lane(q_reg, q + (int64_t) iq3 * sq3 + (int64_t) t * sq2 + (int64_t) iq1 * sq1);
 
         float attn_val = 0.0f;
 #pragma unroll
@@ -234,23 +184,16 @@ __global__ void __launch_bounds__(ggml_cuda_get_physical_warp_size() * num_warps
             }
         }
 
-        if (lane < d_v_per_warp && dv_base + lane < S_v) {
+        if (lane < d_v_per_warp) {
             float * attn_t         = attn_data + (int64_t) t * S_v * H;
             attn_t[dv_base + lane] = attn_val * scale;
         }
     }
 
+    // store state
 #pragma unroll
     for (int r = 0; r < d_v_per_warp; ++r) {
-        const uint32_t dv    = dv_base + r;
-        bool           valid = (dv < S_v);
-        if constexpr (S_v < warp_size) {
-            valid = valid && (lane < active_lanes);
-        }
-        if (valid) {
-            float * row = state_out + (int64_t) dv * S_v + dqk_base;
-            vec_store<d_qk_per_lane>(row, s_tile[r]);
-        }
+        store_qk_lane(s_tile[r], state_out + (int64_t) (dv_base + r) * S_v);
     }
 }
 
