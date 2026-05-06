@@ -25,44 +25,48 @@ struct llm_build_delta_net_base : public llm_graph_context {
 
     virtual ~llm_build_delta_net_base() = default;
 
-    // returns pair of output and new state
-    std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_chunking(
+    // All variants take `s_out` (a view of the ssm-state cache) and write the
+    // updated recurrent state into it; they return only the attention output.
+    ggml_tensor * build_delta_net_chunking(
                 ggml_tensor * q,
                 ggml_tensor * k,
                 ggml_tensor * v,
                 ggml_tensor * g,
                 ggml_tensor * b,
                 ggml_tensor * s,
+                ggml_tensor * s_out,
                         int   il);
 
-    // returns pair of output and new state
-    std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_autoregressive(
+    ggml_tensor * build_delta_net_autoregressive(
                 ggml_tensor * q,
                 ggml_tensor * k,
                 ggml_tensor * v,
                 ggml_tensor * g,
                 ggml_tensor * b,
                 ggml_tensor * s,
+                ggml_tensor * s_out,
                 int           il);
 
-    // use the ggml_gated_delta_net fused operator
-    std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_fused(
+    // use the ggml_gated_delta_net fused operator (writes state directly into s_out)
+    ggml_tensor * build_delta_net_fused(
                 ggml_tensor * q,
                 ggml_tensor * k,
                 ggml_tensor * v,
                 ggml_tensor * g,
                 ggml_tensor * b,
                 ggml_tensor * s,
+                ggml_tensor * s_out,
                         int   il);
 
-    // choose one of two implementations above based on the number of tokens
-    std::pair<ggml_tensor *, ggml_tensor *> build_delta_net(
+    // choose one of the implementations above based on the number of tokens
+    ggml_tensor * build_delta_net(
                 ggml_tensor * q,
                 ggml_tensor * k,
                 ggml_tensor * v,
                 ggml_tensor * g,
                 ggml_tensor * b,
                 ggml_tensor * s,
+                ggml_tensor * s_out,
                         int   il);
 };
 

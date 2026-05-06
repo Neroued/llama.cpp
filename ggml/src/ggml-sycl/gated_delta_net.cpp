@@ -13,7 +13,8 @@ void gated_delta_net_sycl(const float *     q,
                           const float *     g,
                           const float *     beta,
                           const float *     curr_state,
-                          float *           dst,
+                          float *           attn_out,
+                          float *           state_out,
                           int64_t           H,
                           int64_t           n_tokens,
                           int64_t           n_seqs,
@@ -36,12 +37,15 @@ void gated_delta_net_sycl(const float *     q,
     const int      lane     = item_ct1.get_local_id(2);
     const int      col      = item_ct1.get_group(0) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
 
+    GGML_UNUSED(n_seqs);
+
     const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
     const uint32_t iq3 = fastdiv(sequence, rq3_magic);
 
-    const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
-    float *       attn_data        = dst;
-    float *       state            = dst + attn_score_elems;
+    // attn_out / state_out are independent base pointers; state_out comes from
+    // the dst->src[6] view (a slice of an ssm-state cache).
+    float * attn_data = attn_out;
+    float * state     = state_out;
 
     const int64_t state_offset = (sequence * H + h_idx) * S_v * S_v;
     state += state_offset;
@@ -148,7 +152,8 @@ static void launch_gated_delta_net(const float *   q_d,
                                    const float *   g_d,
                                    const float *   b_d,
                                    const float *   s_d,
-                                   float *         dst_d,
+                                   float *         attn_out_d,
+                                   float *         state_out_d,
                                    int64_t         S_v,
                                    int64_t         H,
                                    int64_t         n_tokens,
@@ -182,7 +187,8 @@ static void launch_gated_delta_net(const float *   q_d,
                 constexpr int sv = 16;
                 stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
                                      [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                         gated_delta_net_sycl<sv, KDA>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H, n_tokens,
+                                         gated_delta_net_sycl<sv, KDA>(q_d, k_d, v_d, g_d, b_d, s_d, attn_out_d,
+                                                                       state_out_d, H, n_tokens,
                                                                        n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2,
                                                                        sb3, neqk1_magic, rq3_magic, scale);
                                      });
@@ -193,7 +199,8 @@ static void launch_gated_delta_net(const float *   q_d,
                 constexpr int sv = 32;
                 stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
                                      [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                         gated_delta_net_sycl<sv, KDA>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H, n_tokens,
+                                         gated_delta_net_sycl<sv, KDA>(q_d, k_d, v_d, g_d, b_d, s_d, attn_out_d,
+                                                                       state_out_d, H, n_tokens,
                                                                        n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2,
                                                                        sb3, neqk1_magic, rq3_magic, scale);
                                      });
@@ -205,7 +212,8 @@ static void launch_gated_delta_net(const float *   q_d,
                 stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
                                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                                             gated_delta_net_sycl<sv, KDA>(
-                                                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H, n_tokens, n_seqs, sq1, sq2,
+                                                q_d, k_d, v_d, g_d, b_d, s_d, attn_out_d, state_out_d, H, n_tokens,
+                                                n_seqs, sq1, sq2,
                                                 sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
                                         });
             }
@@ -217,7 +225,8 @@ static void launch_gated_delta_net(const float *   q_d,
                 stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
                                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                                             gated_delta_net_sycl<sv, KDA>(
-                                                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H, n_tokens, n_seqs, sq1, sq2,
+                                                q_d, k_d, v_d, g_d, b_d, s_d, attn_out_d, state_out_d, H, n_tokens,
+                                                n_seqs, sq1, sq2,
                                                 sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
                                         });
             }
@@ -230,12 +239,13 @@ static void launch_gated_delta_net(const float *   q_d,
 }
 
 void ggml_sycl_op_gated_delta_net(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
-    ggml_tensor * src_q     = dst->src[0];
-    ggml_tensor * src_k     = dst->src[1];
-    ggml_tensor * src_v     = dst->src[2];
-    ggml_tensor * src_g     = dst->src[3];
-    ggml_tensor * src_beta  = dst->src[4];
-    ggml_tensor * src_state = dst->src[5];
+    ggml_tensor * src_q         = dst->src[0];
+    ggml_tensor * src_k         = dst->src[1];
+    ggml_tensor * src_v         = dst->src[2];
+    ggml_tensor * src_g         = dst->src[3];
+    ggml_tensor * src_beta      = dst->src[4];
+    ggml_tensor * src_state     = dst->src[5];
+    ggml_tensor * src_state_out = dst->src[6];
 
     GGML_TENSOR_LOCALS(int64_t, neq, src_q, ne);
     GGML_TENSOR_LOCALS(size_t , nbq, src_q, nb);
@@ -262,9 +272,10 @@ void ggml_sycl_op_gated_delta_net(ggml_backend_sycl_context & ctx, ggml_tensor *
     const float * v_d = (const float *) src_v->data;
     const float * g_d = (const float *) src_g->data;
     const float * b_d = (const float *) src_beta->data;
+    const float * s_d = (const float *) src_state->data;
 
-    const float * s_d   = (const float *) src_state->data;
-    float *       dst_d = (float *) dst->data;
+    float * attn_out_d  = (float *) dst->data;
+    float * state_out_d = (float *) src_state_out->data;
 
     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
     GGML_ASSERT(ggml_is_contiguous_rows(src_k));
@@ -274,6 +285,8 @@ void ggml_sycl_op_gated_delta_net(ggml_backend_sycl_context & ctx, ggml_tensor *
     GGML_ASSERT(ggml_is_contiguous(src_g));
     GGML_ASSERT(ggml_is_contiguous(src_beta));
     GGML_ASSERT(ggml_is_contiguous(src_state));
+    GGML_ASSERT(ggml_is_contiguous(src_state_out));
+    GGML_ASSERT(src_state_out->view_src != nullptr);
 
     // strides in floats (beta strides used for both g and beta offset computation)
     const int64_t sq1 = nbq1 / sizeof(float);
@@ -291,17 +304,19 @@ void ggml_sycl_op_gated_delta_net(ggml_backend_sycl_context & ctx, ggml_tensor *
     dpct::queue_ptr stream = ctx.stream();
 
     if (kda) {
-        launch_gated_delta_net<true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
+        launch_gated_delta_net<true>(q_d, k_d, v_d, g_d, b_d, s_d,
+            attn_out_d, state_out_d,
             S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
             sb1, sb2, sb3, neqk1, rq3, scale, stream);
     } else {
-        launch_gated_delta_net<false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
+        launch_gated_delta_net<false>(q_d, k_d, v_d, g_d, b_d, s_d,
+            attn_out_d, state_out_d,
             S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
             sb1, sb2, sb3, neqk1, rq3, scale, stream);
     }
 }
 
 void ggml_sycl_gated_delta_net(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
-    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/6);
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/7);
     ggml_sycl_op_gated_delta_net(ctx, dst);
 }

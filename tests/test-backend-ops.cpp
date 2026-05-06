@@ -3738,22 +3738,47 @@ struct test_gated_delta_net : public test_case {
     const int     v_repeat;
     const bool    permuted;
     const bool    kda;
+    // when true, slice q/k from a packed [Q | K | V] mix tensor so q and k
+    // carry strides that are NOT identical to a freshly-allocated tensor.
+    const bool    qk_mix;
+
+    ggml_tensor * attn_out  = nullptr;
+    ggml_tensor * state_out = nullptr;
 
     std::string vars() override {
-        return VARS_TO_STR8(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda);
+        return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, qk_mix);
     }
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
-            int v_repeat = 1, bool permuted = false, bool kda = false)
+            int v_repeat = 1, bool permuted = false, bool kda = false, bool qk_mix = false)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), qk_mix(qk_mix) {}
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { attn_out, state_out }; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
         ggml_tensor * k;
         ggml_tensor * v;
-        if (permuted) {
+        if (qk_mix) {
+            // Pack q | k | v along the head axis: a single contiguous tensor
+            // [head_size, head_count + head_count + head_count*v_repeat, T, B]
+            // with q/k/v sliced as views. q and k get strides (nb1, nb2, nb3)
+            // tied to the bigger tensor's stride, so they're not packed in dim2/3.
+            const int64_t qk_h    = head_count;
+            const int64_t v_h     = head_count * v_repeat;
+            const int64_t total_h = qk_h * 2 + v_h;
+            ggml_tensor * mix = ggml_new_tensor_4d(ctx, type, head_size, total_h, n_seq_tokens, n_seqs);
+            const size_t  esz = ggml_type_size(type);
+            q = ggml_view_4d(ctx, mix, head_size, qk_h, n_seq_tokens, n_seqs,
+                             mix->nb[1], mix->nb[2], mix->nb[3], 0);
+            k = ggml_view_4d(ctx, mix, head_size, qk_h, n_seq_tokens, n_seqs,
+                             mix->nb[1], mix->nb[2], mix->nb[3], qk_h * head_size * esz);
+            v = ggml_view_4d(ctx, mix, head_size, v_h, n_seq_tokens, n_seqs,
+                             mix->nb[1], mix->nb[2], mix->nb[3], 2 * qk_h * head_size * esz);
+        } else if (permuted) {
             // create with dims 1 and 2 swapped, then permute back to get non-contiguous layout
             q = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, n_seqs), 0, 2, 1, 3);
             k = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, n_seqs), 0, 2, 1, 3);
@@ -3766,9 +3791,23 @@ struct test_gated_delta_net : public test_case {
         const int64_t g_ne0 = kda ? head_size : 1;
         ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, g_ne0, head_count * v_repeat, n_seq_tokens, n_seqs);
         ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, head_count * v_repeat, n_seq_tokens, n_seqs);
-        ggml_tensor * state = ggml_new_tensor_2d(ctx, type, head_size * v_repeat * head_size * head_count, n_seqs);
-        ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state);
-        return out;
+
+        // state_in: a leaf (initialized by the framework). state_out: a view
+        // of a separate "cache" leaf so that view_src != NULL (mirrors how the
+        // op is used inside model code).
+        const int64_t state_nelems = head_size * v_repeat * head_size * head_count;
+        ggml_tensor * state_in       = ggml_new_tensor_2d(ctx, type, state_nelems, n_seqs);
+        ggml_tensor * state_out_base = ggml_new_tensor_2d(ctx, type, state_nelems, n_seqs);
+        ggml_set_name(state_in,       "state_in");
+        ggml_set_name(state_out_base, "state_out_base");
+
+        state_out = ggml_view_2d(ctx, state_out_base, state_nelems, n_seqs,
+                                 state_out_base->nb[1], 0);
+        ggml_set_name(state_out, "state_out");
+
+        attn_out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state_in, state_out);
+        ggml_set_name(attn_out, "attn_out");
+        return attn_out;
     }
 };
 
@@ -8791,6 +8830,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
+    // q/k sliced from a packed [Q | K | V] mix tensor: q and k have strides
+    // tied to the bigger tensor (different from a fresh tensor of the same shape).
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1, 1, 1, false, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, false, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2, false, false, true));
     // KDA (vector gate)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1, 2, 1, false, true));
@@ -9075,6 +9119,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));   // Qwen3.5-like: 32 heads, d=128
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64,  1, 1));   // smaller model
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, true)); // KDA
+    // q/k sliced from a [Q | K | V] mix tensor: realistic model layouts
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1,   1, 1, false, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64,  1, 1, false, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 64,  1, 2, false, false, true)); // H_qk = H_v / 2
     // PP: n_seq_tokens=64,256 (prompt processing)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1));  // PP-64
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1)); // PP-256

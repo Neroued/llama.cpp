@@ -10433,17 +10433,17 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     int64_t ir0,
     int64_t ir1) {
 
-    ggml_tensor * src_q     = dst->src[0];
-    ggml_tensor * src_k     = dst->src[1];
-    ggml_tensor * src_v     = dst->src[2];
-    ggml_tensor * src_g     = dst->src[3];
-    ggml_tensor * src_beta  = dst->src[4];
-    ggml_tensor * src_state = dst->src[5];
+    ggml_tensor * src_q         = dst->src[0];
+    ggml_tensor * src_k         = dst->src[1];
+    ggml_tensor * src_v         = dst->src[2];
+    ggml_tensor * src_g         = dst->src[3];
+    ggml_tensor * src_beta      = dst->src[4];
+    ggml_tensor * src_state     = dst->src[5];
+    ggml_tensor * src_state_out = dst->src[6];
 
     const int64_t S_v      = src_v->ne[0];
     const int64_t H        = src_v->ne[1];
     const int64_t n_tokens = src_v->ne[2];
-    const int64_t n_seqs   = src_v->ne[3];
 
     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
     GGML_ASSERT(ggml_is_contiguous_rows(src_k));
@@ -10451,6 +10451,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     GGML_ASSERT(ggml_is_contiguous(src_g));
     GGML_ASSERT(ggml_is_contiguous(src_beta));
     GGML_ASSERT(ggml_is_contiguous(src_state));
+    GGML_ASSERT(ggml_is_contiguous(src_state_out));
 
     GGML_ASSERT(src_g->ne[0] == 1 || src_g->ne[0] == S_v);
     GGML_ASSERT(src_beta->ne[0] == 1);
@@ -10473,12 +10474,12 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     float * delta = (float *)params->wdata + ith * scratch_per_thread + CACHE_LINE_SIZE_F32;
 
-    // output layout: [attn_scores | new_states]
-    // attn_scores: S_v * H * n_tokens * n_seqs floats
-    // new_states:  S_v * S_v * H * n_seqs floats
-    const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
+    // attn_out: dst (own buffer), [S_v, H, n_tokens, n_seqs] packed
+    // state_out: src[6] (a view of an ssm-state cache; data already points to
+    //            view_src->data + view_offs after alloc). We write the new
+    //            recurrent state through this side-effect output.
     float * attn_out_base  = (float *)dst->data;
-    float * state_out_base = (float *)dst->data + attn_score_elems;
+    float * state_out_base = (float *)src_state_out->data;
 
     const float * state_in_base = (const float *)src_state->data;
 

@@ -2543,6 +2543,7 @@ kernel void kernel_gated_delta_net_impl(
         device const char * b,
         device const char * s,
         device       char * dst,
+        device       char * state_out,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]])  {
@@ -2629,7 +2630,7 @@ kernel void kernel_gated_delta_net_impl(
         g_ptr += args.ne21*G;
     }
 
-    device float * dst_state = (device float *) (dst) + args.ne23*args.ne22*args.ne21*S_v + (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
+    device float * dst_state = (device float *) (state_out) + (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
 
     FOR_UNROLL (short j = 0; j < NSG; j++) {
         const short is = tx*NSG + j;
@@ -2660,6 +2661,7 @@ kernel void kernel_gated_delta_net_impl(
         device const char * b,
         device const char * s,
         device       char * dst,
+        device       char * state_out,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]])  {
@@ -2732,7 +2734,7 @@ kernel void kernel_gated_delta_net_impl(
         dst_attn += args.ne21*S_v;
     }
 
-    device float * dst_state  = (device float *) (dst) + args.ne23*args.ne22*args.ne21*S_v + (i23*args.ne21 + i21)*S_v*S_v + i20;
+    device float * dst_state  = (device float *) (state_out) + (i23*args.ne21 + i21)*S_v*S_v + i20;
     device T     * dstt_state = (device T     *) (dst_state);
 
     FOR_UNROLL (short j = 0; j < NSG; j++) {

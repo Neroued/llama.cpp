@@ -2530,6 +2530,10 @@ extern "C" {
 
     // TODO: add ggml_gated_delta_net_set_bcast() to be able to configure Q, K broadcast type: tiled vs interleaved [TAG_GGML_GDN_BCAST]
     // ref: https://github.com/ggml-org/llama.cpp/pull/19468#discussion_r2786394306
+    //
+    // result tensor is the attention output: [S_v, H_v, n_tokens, n_seqs].
+    // The new recurrent state is written into `state_out` (must be a view of an
+    // ssm-state cache tensor, used as a side-effect output through src[6]).
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2537,7 +2541,8 @@ extern "C" {
             struct ggml_tensor  * v,
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
-            struct ggml_tensor  * state);
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * state_out);
 
     // custom operators
 

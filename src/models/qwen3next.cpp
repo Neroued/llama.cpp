@@ -409,8 +409,11 @@ ggml_tensor * llm_build_qwen3next::build_layer_attn_linear(
     //v_conv = ggml_cont_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 
     // if head keys and value keys are different, repeat to force tensors into matching shapes
-    // TODO: avoid repeats for fused GDN, needs broadcast configuration for GDN op [TAG_GGML_GDN_BCAST]
-    if (num_k_heads != num_v_heads) {
+    // The fused GDN op natively supports H_v != H_qk via modulo-based head mapping;
+    // only repeat for the non-fused path (chunking / autoregressive reference).
+    if (num_k_heads != num_v_heads &&
+        ((n_seq_tokens == 1 && !cparams.fused_gdn_ar) ||
+         (n_seq_tokens >  1 && !cparams.fused_gdn_ch))) {
         GGML_ASSERT(num_v_heads % num_k_heads == 0);
         int64_t repeat_factor = num_v_heads / num_k_heads;
 
@@ -418,15 +421,11 @@ ggml_tensor * llm_build_qwen3next::build_layer_attn_linear(
         ggml_tensor * q_reshaped = ggml_reshape_4d(ctx0, q_conv, head_k_dim, 1, num_k_heads, n_seq_tokens * n_seqs);
         ggml_tensor * k_reshaped = ggml_reshape_4d(ctx0, k_conv, head_k_dim, 1, num_k_heads, n_seq_tokens * n_seqs);
 
-        // Repeat along the third dimension (the new dimension with size 1)
         ggml_tensor * q_repeated =
             ggml_repeat_4d(ctx0, q_reshaped, head_k_dim, repeat_factor, num_k_heads, n_seq_tokens * n_seqs);
         ggml_tensor * k_repeated =
             ggml_repeat_4d(ctx0, k_reshaped, head_k_dim, repeat_factor, num_k_heads, n_seq_tokens * n_seqs);
 
-        // Reshape back to merge the head and repeat dimensions
-        // From [head_dim, repeat_factor, num_k_heads, n_seq_tokens * n_seqs]
-        // Back to [head_dim, repeat_factor * num_k_heads, n_seq_tokens, n_seqs]
         q_conv = ggml_reshape_4d(ctx0, q_repeated, head_k_dim, num_k_heads * repeat_factor, n_seq_tokens, n_seqs);
         k_conv = ggml_reshape_4d(ctx0, k_repeated, head_k_dim, num_k_heads * repeat_factor, n_seq_tokens, n_seqs);
     }
@@ -435,18 +434,15 @@ ggml_tensor * llm_build_qwen3next::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    auto attn_out = build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, il);
+    // state_out: a view of the ssm-state cache at this layer/seq position.
+    // The op (or the build_delta_net wrapper for non-fused paths) writes the
+    // new recurrent state directly into it; no extra ggml_cpy is needed here.
+    ggml_tensor * state_out_view = ggml_view_2d(ctx0, ssm_states_all,
+            hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+            kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all));
 
-    ggml_tensor * output    = attn_out.first;
-    ggml_tensor * new_state = attn_out.second;
+    ggml_tensor * output = build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, state_out_view, il);
     cb(output, "attn_output", il);
-    cb(new_state, "new_state", il);
-
-    // Update the recurrent states
-    ggml_build_forward_expand(gf,
-            ggml_cpy(ctx0, new_state,
-                ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                    kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);

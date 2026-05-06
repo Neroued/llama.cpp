@@ -168,19 +168,16 @@ llm_build_kimi_linear::llm_build_kimi_linear(const llama_model & model, const ll
             Qcur = ggml_l2_norm(ctx0, Qcur, eps_norm);
             Kcur = ggml_l2_norm(ctx0, Kcur, eps_norm);
 
-            // Choose between build_delta_net_chunking and build_delta_net_recurrent based on n_tokens
-            auto attn_out = build_delta_net(Qcur, Kcur, Vcur, g1, beta, state, il);
+            // state_out: a view of the ssm-state cache; the op (or the
+            // build_delta_net wrapper for non-fused paths) writes the new
+            // recurrent state into it.
+            ggml_tensor * state_out_view = ggml_view_1d(ctx0, ssm_states_all,
+                    hparams.n_embd_s() * n_seqs,
+                    kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all));
 
-            ggml_tensor * output = ggml_cont(ctx0, attn_out.first);
-            ggml_tensor * new_state = attn_out.second;
+            ggml_tensor * output = ggml_cont(ctx0,
+                    build_delta_net(Qcur, Kcur, Vcur, g1, beta, state, state_out_view, il));
             cb(output, "attn_output", il);
-            cb(new_state, "new_state", il);
-
-            // Update the recurrent states
-            ggml_build_forward_expand(gf,
-                                     ggml_cpy(ctx0, new_state,
-                                              ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s() * n_seqs,
-                                                           kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
 
             // Output gating g2 = g_b(g_a(x))
             ggml_tensor * cur_2d = ggml_reshape_2d(ctx0, cur, cur->ne[0], n_seq_tokens * n_seqs);

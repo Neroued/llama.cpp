@@ -19,11 +19,13 @@ var<storage, read_write> src_state: array<f32>;
 @group(0) @binding(6)
 var<storage, read_write> dst: array<f32>;
 
+@group(0) @binding(7)
+var<storage, read_write> state_out: array<f32>;
+
 struct Params {
     h: u32,
     n_tokens: u32,
     n_seqs: u32,
-    s_off: u32,
 
     sq1: u32,
     sq2: u32,
@@ -42,7 +44,7 @@ struct Params {
     scale: f32,
 };
 
-@group(0) @binding(7)
+@group(0) @binding(8)
 var<uniform> params: Params;
 
 var<workgroup> sh_k: array<f32, S_V>;
@@ -127,6 +129,6 @@ fn main(
     }
 
     for (var i = 0u; i < S_V; i++) {
-        dst[params.s_off + state_base + col * S_V + i] = state[i];
+        state_out[state_base + col * S_V + i] = state[i];
     }
 }
