@@ -3741,19 +3741,34 @@ struct test_gated_delta_net : public test_case {
     // when true, slice q/k from a packed [Q | K | V] mix tensor so q and k
     // carry strides that are NOT identical to a freshly-allocated tensor.
     const bool    qk_mix;
+    // lower bound for g initialization. Default -0.5 keeps cumsum spread small
+    // (safe for any chunk impl). Pushing toward [-2, 0] simulates real model g
+    // magnitude (g = ssm_a * softplus(alpha + dt)) and stresses chunked
+    // implementations that compute exp(g_r - g_c) before applying triangular
+    // masks: large positive (g_r - g_c) overflows expf(), and inf * 0 = NaN.
+    const float   g_min;
+    // when true, apply ggml_l2_norm to q and k along the head_size axis before
+    // feeding them into the GDN op. Real Qwen3.5/Qwen3-Next-style models do
+    // this (see qwen35moe.cpp build_layer_attn_linear), which makes per-row
+    // q/k magnitude ~ 1/sqrt(S) instead of the ~ 1/sqrt(3) magnitude of the
+    // default uniform[-1, 1] init. This brings K^T*K, T_inv conditioning,
+    // and chunk_output decay magnitudes into the regime real models exercise.
+    const bool    apply_qk_l2_norm;
 
     ggml_tensor * attn_out  = nullptr;
     ggml_tensor * state_out = nullptr;
 
     std::string vars() override {
-        return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, qk_mix);
+        return VARS_TO_STR11(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, qk_mix, g_min, apply_qk_l2_norm);
     }
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
-            int v_repeat = 1, bool permuted = false, bool kda = false, bool qk_mix = false)
+            int v_repeat = 1, bool permuted = false, bool kda = false, bool qk_mix = false,
+            float g_min = -0.5f, bool apply_qk_l2_norm = false)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda), qk_mix(qk_mix) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), qk_mix(qk_mix), g_min(g_min),
+          apply_qk_l2_norm(apply_qk_l2_norm) {}
 
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { attn_out, state_out }; }
@@ -3788,6 +3803,15 @@ struct test_gated_delta_net : public test_case {
             k = ggml_new_tensor_4d(ctx, type, head_size, head_count, n_seq_tokens, n_seqs);
             v = ggml_new_tensor_4d(ctx, type, head_size, head_count * v_repeat, n_seq_tokens, n_seqs);
         }
+        if (apply_qk_l2_norm) {
+            // Mirror real model: q_conv / k_conv get an L2 norm along head_size
+            // before being fed to the GDN op. v is not normalized (matches
+            // qwen35moe.cpp build_layer_attn_linear).
+            constexpr float l2_eps = 1e-6f;
+            q = ggml_l2_norm(ctx, q, l2_eps);
+            k = ggml_l2_norm(ctx, k, l2_eps);
+        }
+
         const int64_t g_ne0 = kda ? head_size : 1;
         ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, g_ne0, head_count * v_repeat, n_seq_tokens, n_seqs);
         ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, head_count * v_repeat, n_seq_tokens, n_seqs);
@@ -3821,9 +3845,9 @@ struct test_gated_delta_net : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             const std::string name = ggml_get_name(t);
             if (name == "g") {
-                // log-decay: g <= 0 so exp(g) in (0, 1]. Use [-0.5, 0]
-                // (typical post-softplus magnitude in real GDN models).
-                init_tensor_uniform(t, -0.5f, 0.0f);
+                // log-decay: g <= 0 so exp(g) in (0, 1]. Default [-0.5, 0]
+                // is safe; tests that exercise wider g ranges use g_min.
+                init_tensor_uniform(t, g_min, 0.0f);
             } else if (name == "beta") {
                 // beta is a delta-rule gate in [0, 1].
                 init_tensor_uniform(t, 0.0f, 1.0f);
@@ -3845,6 +3869,66 @@ struct test_gated_delta_net : public test_case {
             && n_seq_tokens >= 64
             && (head_size == 16 || head_size == 32 || head_size == 64 || head_size == 128);
         return chunked_path ? 5e-4 : 1e-7;
+    }
+};
+
+// run3 E1: chain GDN + Q4_K mul_mat in a single graph for micro-bench.
+// Same geometry as a Qwen3.5-35B-A3B GDN-bearing layer's tail:
+//   GDN(B,L,H_v,H_qk,S=128) -> reshape -> mul_mat(W_o[d_inner,n_embd_out], Q4_K).
+// Used in perf mode to compare aronly vs chunked binaries on the same graph.
+struct test_gdn_mmq_chain : public test_case {
+    const int64_t H_v;
+    const int64_t H_qk;
+    const int64_t S;
+    const int64_t L;
+    const int64_t B;
+    const int64_t n_embd_out;
+
+    std::string vars() override {
+        return VARS_TO_STR6(H_v, H_qk, S, L, B, n_embd_out);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_gdn_mmq_chain(int64_t H_v = 32, int64_t H_qk = 16, int64_t S = 128,
+                      int64_t L = 512, int64_t B = 1, int64_t n_embd_out = 2048)
+        : H_v(H_v), H_qk(H_qk), S(S), L(L), B(B), n_embd_out(n_embd_out) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_qk, L, B);
+        ggml_tensor * k     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_qk, L, B);
+        ggml_tensor * v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_v,  L, B);
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, L, B);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, L, B);
+        ggml_set_name(g,    "g");
+        ggml_set_name(beta, "beta");
+
+        const int64_t state_nelems   = S * S * H_v;
+        ggml_tensor * state_in       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, state_nelems, B);
+        ggml_tensor * state_out_base = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, state_nelems, B);
+        ggml_tensor * state_out      = ggml_view_2d(ctx, state_out_base, state_nelems, B,
+                                                    state_out_base->nb[1], 0);
+
+        ggml_tensor * attn_out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state_in, state_out);
+        ggml_set_name(attn_out, "attn_out");
+
+        const int64_t d_inner = S * H_v;
+        ggml_tensor * attn_2d = ggml_reshape_2d(ctx, attn_out, d_inner, L * B);
+
+        ggml_tensor * W_o = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, d_inner, n_embd_out);
+        ggml_set_name(W_o, "W_o");
+        ggml_tensor * out = ggml_mul_mat(ctx, W_o, attn_2d);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "g")        { init_tensor_uniform(t, -0.5f, 0.0f); }
+            else if (name == "beta"){ init_tensor_uniform(t,  0.0f, 1.0f); }
+            else                    { init_tensor_uniform(t); }
+        }
     }
 };
 
@@ -8899,6 +8983,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32,  32,  64,  1));                 // chunked S=32
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32,  16,  64,  1));                 // chunked S=16
 
+    // Run3 follow-up: real Qwen3.5-A3B GDN-bearing layer shape (H_qk=16, H_v=32,
+    // S=128, qk_mix=true) at multi-chunk lengths. The single existing
+    // qk_mix=true chunked test is L=64 (one chunk); model breaks at L>=128 in
+    // real inference, so cover several multi-chunk + tail combos here.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 128, 1, 2, false, false, true)); // 2 chunks
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 192, 1, 2, false, false, true)); // 3 chunks
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 200, 1, 2, false, false, true)); // 3 chunks + 8 tail
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 1, 2, false, false, true)); // 4 chunks
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 128, 2, 2, false, false, true)); // 2 chunks × 2 seqs
+    // L >= 512 with raw uniform[-1,1] q/k overflows even the CPU AR fp32
+    // reference; cover long sequences in the L2-norm sweep below instead.
+
+    // Realistic-distribution chunked tests: qk_mix=true (packed Q|K|V layout)
+    // + L2 norm on q/k (matches qwen35moe.cpp:320-321) + wider g_min that
+    // simulates real per-token g = ssm_a * softplus(alpha + dt). Without L2
+    // norm the q/k magnitude (~ 1/sqrt(3)) is ~6.6x larger than real models
+    // (~ 1/sqrt(S)); raw uniform inputs at chunk-boundary lengths (e.g. L=512
+    // with g_min=-0.5) push expf and TF32 accumulators outside fp32 safe
+    // range -- the AR fp32 CPU reference also overflows there, so they don't
+    // represent a real model failure. The L2-norm sweep below covers the
+    // shapes/lengths/seq counts the model actually exercises end-to-end.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  64, 1, 2, false, false, true, -0.5f, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 128, 1, 2, false, false, true, -0.5f, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 200, 1, 2, false, false, true, -0.5f, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 1, 2, false, false, true, -0.5f, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 2, false, false, true, -0.5f, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 2, 2, false, false, true, -0.5f, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 128, 1, 2, false, false, true, -1.5f, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 128, 1, 2, false, false, true, -3.0f, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 1, 2, false, false, true, -3.0f, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 1, 2, false, false, true, -5.0f, true));
+
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
     test_cases.emplace_back(new test_llama(2, true));
@@ -9188,6 +9304,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+
+    // run3 E1 micro-bench: GDN + Q4_K mul_mat chain (35B-A3B layer geometry).
+    // Compare aronly vs chunked binaries on the same graph.
+    test_cases.emplace_back(new test_gdn_mmq_chain(32, 16, 128, 512, 1, 2048));
+    test_cases.emplace_back(new test_gdn_mmq_chain(32, 16, 128, 256, 1, 2048));
+    test_cases.emplace_back(new test_gdn_mmq_chain(32, 16, 128, 1024, 1, 2048));
 
     return test_cases;
 }
