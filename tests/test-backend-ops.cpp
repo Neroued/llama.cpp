@@ -3791,6 +3791,13 @@ struct test_gated_delta_net : public test_case {
         const int64_t g_ne0 = kda ? head_size : 1;
         ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, g_ne0, head_count * v_repeat, n_seq_tokens, n_seqs);
         ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, head_count * v_repeat, n_seq_tokens, n_seqs);
+        // Tag g / beta so initialize_tensors can clamp them to numerically
+        // stable ranges. The recurrence s = exp(g) * s + ... explodes when
+        // g > 0; chunked decay terms `exp(g_C - g_r)` likewise blow up if
+        // g is unbounded above. Default uniform [-1, 1] init is fine for
+        // n_tokens <= a handful but produces NaN at chunk-length sequences.
+        ggml_set_name(g,    "g");
+        ggml_set_name(beta, "beta");
 
         // state_in: a leaf (initialized by the framework). state_out: a view
         // of a separate "cache" leaf so that view_src != NULL (mirrors how the
@@ -3808,6 +3815,36 @@ struct test_gated_delta_net : public test_case {
         attn_out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state_in, state_out);
         ggml_set_name(attn_out, "attn_out");
         return attn_out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "g") {
+                // log-decay: g <= 0 so exp(g) in (0, 1]. Use [-0.5, 0]
+                // (typical post-softplus magnitude in real GDN models).
+                init_tensor_uniform(t, -0.5f, 0.0f);
+            } else if (name == "beta") {
+                // beta is a delta-rule gate in [0, 1].
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_nmse_err() override {
+        // The CUDA chunked path (n_tokens >= 64 && !kda && S in {16,32,64,128})
+        // uses TF32 mma.sync.aligned, which keeps 10 mantissa bits (vs fp32's
+        // 23). Each output element accumulates many TF32 mmas across the
+        // chunked pipeline (KKT, T_inv, recompute_wu, state_passing,
+        // chunk_output), so NMSE in the 1e-6 .. 1e-4 range is expected when
+        // comparing against the AR fp32 CPU reference. AR-only paths
+        // (n_tokens < 64 or KDA) keep the strict fp32 1e-7 budget.
+        const bool chunked_path = !kda
+            && n_seq_tokens >= 64
+            && (head_size == 16 || head_size == 32 || head_size == 64 || head_size == 128);
+        return chunked_path ? 5e-4 : 1e-7;
     }
 };
 
@@ -8844,6 +8881,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true,  true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 4, 2, 1, true,  true));
+    // Chunked CUDA path: ggml_cuda_op_gated_delta_net routes
+    // !KDA && S_v in {16,32,64,128} && n_tokens >= 64 through the 4-stage
+    // chunked kernel, with a row-per-warp AR tail for n_tokens % 64 != 0.
+    // CPU AR remains the ground truth for every case below.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128,  64,  1));                 // chunked single full chunk
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128,  65,  1));                 // chunked + 1-token tail
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 100,  1));                 // chunked + 36-token tail
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 127,  1));                 // chunked + 63-token tail (max)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128,  32,  1));                 // pure AR (n_tokens < 64)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128,  64,  2));                 // chunked + multi-seq full chunks
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 128,  2));                 // chunked + multi-seq + 2 chunks
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128,  65,  2));                 // split + multi-seq (per-batch chunked + AR tail)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128,  64,  1, 1, false, true)); // KDA n_tokens=64 must run AR
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  64,  1, 2, false, false, true)); // chunked + H_qk = H_v/2 + qk_mix
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32,  64,  64,  1));                 // chunked S=64
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32,  32,  64,  1));                 // chunked S=32
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32,  16,  64,  1));                 // chunked S=16
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

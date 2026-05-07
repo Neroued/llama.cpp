@@ -100,8 +100,12 @@ if (CUDAToolkit_FOUND)
 
     file(GLOB   GGML_HEADERS_CUDA "*.cuh")
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
+    file(GLOB   GDN_CHUNKED_HEADERS "gdn_chunked/*.cuh" "gdn_chunked/*.h")
+    list(APPEND GGML_HEADERS_CUDA ${GDN_CHUNKED_HEADERS})
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
+    file(GLOB   GDN_CHUNKED_SOURCES "gdn_chunked/*.cu")
+    list(APPEND GGML_SOURCES_CUDA ${GDN_CHUNKED_SOURCES})
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
