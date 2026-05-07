@@ -399,23 +399,31 @@ prepare_wy_wu_gdn_kernel(const float * __restrict__ k_in,
 
         const bool is_diag = (j_sub == warp);
 
-        const float m00 = (!is_diag || r_g0 > c0) ? 1.0f : 0.0f;
-        const float m01 = (!is_diag || r_g0 > c1) ? 1.0f : 0.0f;
-        const float m10 = (!is_diag || r_g1 > c0) ? 1.0f : 0.0f;
-        const float m11 = (!is_diag || r_g1 > c1) ? 1.0f : 0.0f;
-        const float m02 = (!is_diag || r_g0 > c2) ? 1.0f : 0.0f;
-        const float m03 = (!is_diag || r_g0 > c3) ? 1.0f : 0.0f;
-        const float m12 = (!is_diag || r_g1 > c2) ? 1.0f : 0.0f;
-        const float m13 = (!is_diag || r_g1 > c3) ? 1.0f : 0.0f;
+        const bool m00 = !is_diag || r_g0 > c0;
+        const bool m01 = !is_diag || r_g0 > c1;
+        const bool m10 = !is_diag || r_g1 > c0;
+        const bool m11 = !is_diag || r_g1 > c1;
+        const bool m02 = !is_diag || r_g0 > c2;
+        const bool m03 = !is_diag || r_g0 > c3;
+        const bool m12 = !is_diag || r_g1 > c2;
+        const bool m13 = !is_diag || r_g1 > c3;
 
-        A_reg[j_sub][0] = nbeta_r0 * A_reg[j_sub][0] * expf(g_r0 - g_c0) * m00;
-        A_reg[j_sub][1] = nbeta_r0 * A_reg[j_sub][1] * expf(g_r0 - g_c1) * m01;
-        A_reg[j_sub][2] = nbeta_r1 * A_reg[j_sub][2] * expf(g_r1 - g_c0) * m10;
-        A_reg[j_sub][3] = nbeta_r1 * A_reg[j_sub][3] * expf(g_r1 - g_c1) * m11;
-        A_reg[j_sub][4] = nbeta_r0 * A_reg[j_sub][4] * expf(g_r0 - g_c2) * m02;
-        A_reg[j_sub][5] = nbeta_r0 * A_reg[j_sub][5] * expf(g_r0 - g_c3) * m03;
-        A_reg[j_sub][6] = nbeta_r1 * A_reg[j_sub][6] * expf(g_r1 - g_c2) * m12;
-        A_reg[j_sub][7] = nbeta_r1 * A_reg[j_sub][7] * expf(g_r1 - g_c3) * m13;
+        // NaN-guard: g_cumsum is monotone non-increasing (g <= 0). On the
+        // lower triangle (m == true) g_r - g_c <= 0 and expf is bounded by 1.
+        // On the upper triangle (m == false) g_r - g_c >= 0 and with realistic
+        // per-token |g| ~ 1..5 over BT=64 it can exceed expf's safe range
+        // (~88), so expf overflows to +inf. Routing those lanes through a
+        // selp (?:) bypass to 0.0 keeps the result finite without going
+        // through the inf * 0 = NaN trap, while also folding the mask into
+        // the same selp (saves one fmul per element vs. an explicit `* m`).
+        A_reg[j_sub][0] = m00 ? nbeta_r0 * A_reg[j_sub][0] * expf(g_r0 - g_c0) : 0.0f;
+        A_reg[j_sub][1] = m01 ? nbeta_r0 * A_reg[j_sub][1] * expf(g_r0 - g_c1) : 0.0f;
+        A_reg[j_sub][2] = m10 ? nbeta_r1 * A_reg[j_sub][2] * expf(g_r1 - g_c0) : 0.0f;
+        A_reg[j_sub][3] = m11 ? nbeta_r1 * A_reg[j_sub][3] * expf(g_r1 - g_c1) : 0.0f;
+        A_reg[j_sub][4] = m02 ? nbeta_r0 * A_reg[j_sub][4] * expf(g_r0 - g_c2) : 0.0f;
+        A_reg[j_sub][5] = m03 ? nbeta_r0 * A_reg[j_sub][5] * expf(g_r0 - g_c3) : 0.0f;
+        A_reg[j_sub][6] = m12 ? nbeta_r1 * A_reg[j_sub][6] * expf(g_r1 - g_c2) : 0.0f;
+        A_reg[j_sub][7] = m13 ? nbeta_r1 * A_reg[j_sub][7] * expf(g_r1 - g_c3) : 0.0f;
     }
 
     // === Phase WY-C diag: scatter A_reg[w][w] -> M_view, in-place forward sub ===
