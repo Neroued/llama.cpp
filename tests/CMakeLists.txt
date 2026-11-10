@@ -289,6 +289,7 @@ llama_build(test-fusion.cpp)
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)
 llama_build_and_test(test-jinja.cpp  LABEL behavior)
+llama_build(bench-jinja.cpp)
 llama_test(test-jinja  NAME test-jinja-py  ARGS -py  LABEL "python behavior")
 llama_test_cmd(python3
     NAME test-conversion-fp8
