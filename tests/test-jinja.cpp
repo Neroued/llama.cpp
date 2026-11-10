@@ -1,18 +1,18 @@
-#include <string>
-#include <iostream>
-#include <random>
-#include <cstdlib>
-
+#include "jinja/caps.h"
+#include "jinja/lexer.h"
+#include "jinja/parser.h"
+#include "jinja/runtime.h"
+#include "jinja/utils.h"
 #include "json.h"
 #include "subproc.h"
-
-#include "jinja/runtime.h"
-#include "jinja/parser.h"
-#include "jinja/lexer.h"
-#include "jinja/utils.h"
-#include "jinja/caps.h"
-
 #include "testing.h"
+
+#include <cstdlib>
+#include <future>
+#include <iostream>
+#include <limits>
+#include <random>
+#include <string>
 
 using json = common_json;
 
@@ -40,6 +40,9 @@ static void test_caps(testing & t);
 static void test_string_parts(testing & t);
 static void test_fuzzing(testing & t);
 
+static void test_lazy_execution(testing & t);
+static void test_shared_render(testing & t);
+
 static bool g_python_mode = false;
 
 int main(int argc, char *argv[]) {
@@ -63,6 +66,7 @@ int main(int argc, char *argv[]) {
     t.test("whitespace control", test_whitespace_control);
     t.test("conditionals", test_conditionals);
     t.test("loops", test_loops);
+    t.test("lazy execution", test_lazy_execution);
     t.test("expressions", test_expressions);
     t.test("set statement", test_set_statement);
     t.test("filters", test_filters);
@@ -76,6 +80,7 @@ int main(int argc, char *argv[]) {
     t.test("array methods", test_array_methods);
     t.test("object methods", test_object_methods);
     if (!g_python_mode) {
+        t.test("shared render", test_shared_render);
         t.test("hasher", test_hasher);
         t.test("stats", test_stats);
         t.test("caps", test_caps);
@@ -84,6 +89,126 @@ int main(int argc, char *argv[]) {
     }
 
     return t.summary();
+}
+
+static void test_lazy_execution(testing & t) {
+    test_template(t, "large range early exit", "{% for i in range(100000) %}{{ i }}{% break %}{% endfor %}",
+                  json::object(), "0");
+    test_template(t, "range slice without full materialization",
+                  "{{ range(100000)[:3]|list|tojson }}|{{ range(5,-2,-2)[-1] }}|{{ range(100000)|last }}",
+                  json::object(), "[0, 1, 2]|-1|99999");
+    test_template(t, "unreached unpack", "{% for a,b in [[1,2],[3]] %}{{ a }}{% break %}{% endfor %}", json::object(),
+                  "1");
+    test_template(t, "filter evaluated on consumption",
+                  "{% set ns=namespace(n=0) %}{% for i in [1,2,3] if i>ns.n %}{{ i }}{% set ns.n=3 %}{% endfor %}",
+                  json::object(), "1");
+    test_template(t, "filtered length consumes remainder",
+                  "{% set ns=namespace(n=0) %}{% for i in [1,2,3] if i>ns.n %}{{ i }}/{{ loop.length }}{% set ns.n=3 "
+                  "%}{% endfor %}",
+                  json::object(), "1/32/33/3");
+    const json list_input = {
+        { "a", json::array({ 1, 2 }) }
+    };
+    test_template(t, "filtered length keeps exhausted source closed",
+                  "{% for i in a if i>0 %}{{ i }}/{{ loop.length }};{% if i==1 %}{% set _=a.append(3) %}{% endif %}"
+                  "{% endfor %}",
+                  list_input, "1/2;2/2;");
+    test_template(t, "lookahead keeps exhausted source closed",
+                  "{% for i in a %}{{ i }}:{{ loop.last }};{% if i==2 %}{% set _=a.append(3) %}{% endif %}{% endfor %}",
+                  list_input, "1:False;2:True;");
+    test_template(
+        t, "list length does not exhaust source",
+        "{% for i in a %}{{ i }}/{{ loop.length }};{% if i==2 %}{% set _=a.append(3) %}{% endif %}{% endfor %}",
+        list_input, "1/2;2/2;3/2;");
+    test_template(t, "lazy loop lookahead",
+                  "{% for i in range(5) if i%2==0 %}{{ loop.index }}:{{ i }}:{{ loop.previtem|default('-') }}:{{ "
+                  "loop.nextitem|default('-') }}:{{ loop.first }}:{{ loop.last }}:{{ loop.revindex }};{% endfor %}",
+                  json::object(), "1:0:-:2:True:False:3;2:2:0:4:False:False:2;3:4:2:-:False:True:1;");
+    test_template(t, "nested break preserves output",
+                  "{% for i in [1,2] %}A{% if true %}B{% break %}C{% endif %}D{% else %}E{% endfor %}", json::object(),
+                  "ABE");
+    test_template(t, "nested continue preserves output",
+                  "{% for i in [1,2] %}A{% if true %}B{% continue %}C{% endif %}D{% else %}E{% endfor %}",
+                  json::object(), "ABABE");
+    test_template(t, "interrupted captured blocks",
+                  "{% for i in [1] %}{% set x %}A{% break %}{% endset %}B{% else %}E{% endfor %}|{% for i in [1] %}{% "
+                  "filter upper %}a{% break %}{% endfilter %}B{% else %}E{% endfor %}",
+                  json::object(), "E|E");
+    test_template(t, "escaped loop metadata",
+                  "{% set ns=namespace(l=none) %}{% for x in [1,2,3] if x>1 %}{% set ns.l=loop %}{% break %}{% endfor "
+                  "%}{{ ns.l.index }}|{{ ns.l.length }}|{{ ns.l.nextitem }}",
+                  json::object(), "1|2|3");
+}
+
+static void test_shared_render(testing & t) {
+    test_template(t, "loop object access",
+                  "{% for i in [1,2] %}{{ 'index' in loop }}:{{ loop.index }}:{{ loop['length'] }};{% endfor %}",
+                  json::object(), "True:1:2;True:2:2;");
+    test_template(t, "loop object assignment",
+                  "{% for i in [1,2] %}{% set loop.index=9 %}{{ loop.index }};{% endfor %}", json::object(), "9;9;");
+    test_template(
+        t, "macro inherits call-site bindings",
+        "{% set x='outer' %}{% macro m() %}{{ x }}{% endmacro %}{% for x in ['inner'] %}{{ m() }}{% endfor %}",
+        json::object(), "inner");
+    test_template(t, "caller snapshots visible bindings",
+                  "{% set ns=namespace(f=none) %}{% macro save() %}{% set ns.f=caller %}{% endmacro %}{% set x='old' "
+                  "%}{% call save() %}{{ x }}{% endcall %}{% set x='new' %}{{ ns.f() }}",
+                  json::object(), "old");
+    t.test("shared AST with stats and input marking", [](testing & t) {
+        const std::string source =
+            "{% macro emit(x) %}{{ x }}{% endmacro %}{% for i in range(2) %}{{ emit(prefix) }}{{ i }}{% endfor %}{% "
+            "filter upper %}{{ body }}{% endfilter %}|{{ 'literal' is string }}|{{ obj.value }}";
+        const auto                     program = jinja::parse_from_tokens(jinja::lexer().tokenize(source));
+        std::vector<std::future<bool>> workers;
+        for (int worker = 0; worker < 8; ++worker) {
+            workers.push_back(std::async(std::launch::async, [&, worker] {
+                const auto prefix = "p" + std::to_string(worker);
+                for (int i = 0; i < 25; ++i) {
+                    jinja::context ctx(source);
+                    ctx.is_get_stats = i % 2 != 0;
+                    jinja::global_from_json(
+                        ctx,
+                        json{
+                            { "prefix", prefix               },
+                            { "body",   "hi"                 },
+                            { "obj",    { { "value", "V" } } }
+                    },
+                        true);
+                    const auto result = jinja::runtime::gather_string_parts(jinja::runtime(ctx).execute(program));
+                    if (result->as_string().str() != prefix + "0" + prefix + "1HI|True|V") {
+                        return false;
+                    }
+                    if (ctx.get_val("obj")->at("value")->stats.used != ctx.is_get_stats) {
+                        return false;
+                    }
+                    if (result->val_str.parts.empty() || !result->val_str.parts.front().is_input ||
+                        !result->val_str.parts.back().is_input) {
+                        return false;
+                    }
+                }
+                return true;
+            }));
+        }
+        for (auto & worker : workers) {
+            t.assert_true("request-local state", worker.get());
+        }
+    });
+    t.test("lazy range preserves array operations", [](testing & t) {
+        using namespace jinja;
+        auto  range = mk_val<value_range>(0, 3, 1);
+        value array =
+            mk_val<value_array>(std::vector<value>{ mk_val<value_int>(0), mk_val<value_int>(1), mk_val<value_int>(2) });
+        t.assert_true("equivalent array and hash",
+                      *range == *array && range->unique_hash().digest() == array->unique_hash().digest());
+        range->push_back(mk_val<value_int>(9));
+        range->reverse();
+        t.assert_true("materialized mutations", range->size() == 4 && range->element(0)->as_int() == 9);
+        auto descending = mk_val<value_range>(INT64_MAX, INT64_MIN, INT64_MIN);
+        t.assert_true("large negative stride", descending->size() == 2 && descending->element(1)->as_int() == -1);
+        auto ascending = mk_val<value_range>(INT64_MIN, INT64_MAX, INT64_MAX);
+        t.assert_true("large positive stride",
+                      ascending->size() == 3 && ascending->element(2)->as_int() == INT64_MAX - 1);
+    });
 }
 
 static void test_whitespace_control(testing & t) {
