@@ -154,6 +154,117 @@ static void test_shared_render(testing & t) {
                   "{% set ns=namespace(f=none) %}{% macro save() %}{% set ns.f=caller %}{% endmacro %}{% set x='old' "
                   "%}{% call save() %}{{ x }}{% endcall %}{% set x='new' %}{{ ns.f() }}",
                   json::object(), "old");
+    t.test("caller capture lifetime", [](testing & t) {
+        using namespace jinja;
+        for (bool save : { false, true }) {
+            const std::string source =
+                "{% set ns=namespace(f=none) %}{% macro sink() %}"
+                "{% if save %}{% set ns.f=caller %}{% else %}{{ caller() }}{% endif %}{% endmacro %}"
+                "{% for i in range(16) %}{% set token=make_token() %}{% call sink() %}{% endcall %}{% endfor %}";
+            const auto                          program = parse_from_tokens(lexer().tokenize(source));
+            std::vector<std::weak_ptr<value_t>> tokens;
+            const auto                          alive = [&] {
+                return std::count_if(tokens.begin(), tokens.end(), [](const auto & token) { return !token.expired(); });
+            };
+            {
+                context ctx(source);
+                ctx.set_val("save", mk_val<value_bool>(save));
+                ctx.set_val("make_token", mk_val<value_func>("make_token", [&](const func_args &) -> value {
+                                value token = mk_val<value_string>("value");
+                                tokens.emplace_back(token);
+                                return token;
+                            }));
+                runtime(ctx).execute(program);
+                t.assert_true("only the saved caller retains its local value", alive() == (save ? 1 : 0));
+            }
+            t.assert_true("render releases saved captures", alive() == 0);
+        }
+    });
+    t.test("caller snapshot metadata and teardown", [](testing & t) {
+        using namespace jinja;
+        const std::string source =
+            "{% set ns=namespace(f=none) %}{% macro save() %}{% set ns.f=caller %}{% endmacro %}"
+            "{% call save() %}{{ clock() }}{% endcall %}";
+        const auto program = parse_from_tokens(lexer().tokenize(source));
+        value      saved;
+        {
+            context ctx(source);
+            ctx.current_time = 17;
+            ctx.set_val("clock", mk_val<value_func>("clock", [](const func_args & args) -> value {
+                            return mk_val<value_int>(args.ctx.current_time);
+                        }));
+            runtime(ctx).execute(program);
+            saved            = ctx.get_val("ns")->at("f");
+            ctx.current_time = 29;
+            func_args  args(ctx);
+            const auto text = runtime::gather_string_parts(saved->invoke(args))->as_string().str();
+            t.assert_true("caller retains its time snapshot", text == "17");
+        }
+        bool ended = false;
+        try {
+            context   next;
+            func_args args(next);
+            saved->invoke(args);
+        } catch (const std::runtime_error &) {
+            ended = true;
+        }
+        t.assert_true("caller cannot execute an ended render", ended);
+        saved.reset();
+    });
+    t.test("caller error releases capture", [](testing & t) {
+        using namespace jinja;
+        const std::string source =
+            "{% macro sink() %}{{ caller() }}{% endmacro %}{% for i in [1] %}"
+            "{% set token=make_token() %}{% call sink() %}{{ raise_exception('stop') }}{% endcall %}{% endfor %}";
+        const auto             program = parse_from_tokens(lexer().tokenize(source));
+        std::weak_ptr<value_t> token;
+        context                ctx(source);
+        ctx.set_val("make_token", mk_val<value_func>("make_token", [&](const func_args &) -> value {
+                        value result = mk_val<value_string>("value");
+                        token        = result;
+                        return result;
+                    }));
+        bool failed = false;
+        try {
+            runtime(ctx).execute(program);
+        } catch (const std::exception &) {
+            failed = true;
+        }
+        t.assert_true("failed call releases its local value before render ends", failed && token.expired());
+    });
+    t.test("reserved loop target", [](testing & t) {
+        for (const auto * source :
+             { "{% for loop in [1,2] %}{{ loop }}{% endfor %}", "{% for loop,x in [[1,2]] %}{{ x }}{% endfor %}" }) {
+            bool rejected = false;
+            try {
+                jinja::parse_from_tokens(jinja::lexer().tokenize(source));
+            } catch (const jinja::parser_exception &) {
+                rejected = true;
+            }
+            t.assert_true("special loop name cannot be assigned by a for target", rejected);
+        }
+    });
+    t.test("loop metadata after render teardown", [](testing & t) {
+        using namespace jinja;
+        const std::string source =
+            "{% set ns=namespace(l=none) %}{% for x in [1,2,3] if x>1 %}"
+            "{% set ns.l=loop %}{% break %}{% endfor %}";
+        const auto program = parse_from_tokens(lexer().tokenize(source));
+        value      saved;
+        {
+            context ctx(source);
+            runtime(ctx).execute(program);
+            saved = ctx.get_val("ns")->at("l");
+        }
+        bool ended = false;
+        try {
+            saved->find(mk_val<value_string>("length"));
+        } catch (const std::runtime_error &) {
+            ended = true;
+        }
+        t.assert_true("loop cannot consume an ended render", ended);
+        saved.reset();
+    });
     t.test("shared AST with stats and input marking", [](testing & t) {
         const std::string source =
             "{% macro emit(x) %}{{ x }}{% endmacro %}{% for i in range(2) %}{{ emit(prefix) }}{{ i }}{% endfor %}{% "
@@ -166,14 +277,12 @@ static void test_shared_render(testing & t) {
                 for (int i = 0; i < 25; ++i) {
                     jinja::context ctx(source);
                     ctx.is_get_stats = i % 2 != 0;
-                    jinja::global_from_json(
-                        ctx,
-                        json{
-                            { "prefix", prefix               },
-                            { "body",   "hi"                 },
-                            { "obj",    { { "value", "V" } } }
-                    },
-                        true);
+                    const json input = {
+                        { "prefix", prefix },
+                        { "body", "hi" },
+                        { "obj", { { "value", "V" } } }
+                    };
+                    jinja::global_from_json(ctx, input, true);
                     const auto result = jinja::runtime::gather_string_parts(jinja::runtime(ctx).execute(program));
                     if (result->as_string().str() != prefix + "0" + prefix + "1HI|True|V") {
                         return false;

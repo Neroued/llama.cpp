@@ -334,7 +334,7 @@ struct value_string_t : public value_t {
         return ss.str();
     }
 
-    virtual bool                  as_bool() const override { return !val_str.empty(); }
+    virtual bool as_bool() const override { return !val_str.empty(); }
     virtual const func_builtins & get_builtins() const override;
     virtual bool is_hashable() const override { return true; }
     virtual hasher unique_hash() const noexcept override {
@@ -368,7 +368,7 @@ struct value_bool_t : public value_t {
 
     virtual int64_t as_int() const override { return val_int; }
 
-    virtual double                as_float() const override { return val_flt; }
+    virtual double as_float() const override { return val_flt; }
     virtual bool as_bool() const override { return val_int; }
     virtual string as_string() const override { return std::string(val_int ? "True" : "False"); }
     virtual const func_builtins & get_builtins() const override;
@@ -378,7 +378,7 @@ struct value_bool_t : public value_t {
     virtual bool is_hashable() const override { return true; }
 
     virtual hasher unique_hash() const noexcept override { return value_int_t(val_int).unique_hash(); }
-  protected:
+protected:
     virtual bool equivalent(const value_t & other) const override {
         return other.is_numeric() && val_int == other.as_int() && val_flt == other.as_float();
     }

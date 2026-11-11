@@ -496,7 +496,7 @@ class iterable_cursor {
     value    input;
     bool     object_items;
     bool     exhausted = false;
-    uint64_t offset = 0;
+    uint64_t offset    = 0;
 };
 
 class variable_binding {
@@ -576,6 +576,7 @@ class loop_value final : public value_object_t {
     }
 
     value & at(const value & key, value & fallback) override {
+        filter_scope_.ensure_active();
         if (!unordered.empty()) {
             auto found = unordered.find(key);
             if (found != unordered.end()) {
@@ -672,6 +673,7 @@ class loop_value final : public value_object_t {
     }
 
     value read() {
+        filter_scope_.ensure_active();
         while (auto item = source_.next()) {
             if (filter_) {
                 filter_scope_.clear_locals();
@@ -907,11 +909,11 @@ value call_statement::execute_impl(context & ctx) const {
     }
     auto * callee_func = cast_val<value_func>(callee_val);
 
-    const func_handler func = [this, scope = ctx.capture_scope()](const func_args & args) -> value {
+    const func_handler func = [this, caller_ctx = ctx.snapshot()](const func_args & args) -> value {
         if (args.ctx.macro_depth >= JINJA_RECURSIVE_LIMIT) {
             throw std::runtime_error("macro calls are nested more than " + std::to_string(JINJA_RECURSIVE_LIMIT) + " levels deep");
         }
-        context block_ctx(args.ctx, scope);
+        context block_ctx(caller_ctx);
         block_ctx.macro_depth = args.ctx.macro_depth + 1;
 
         bind_parameters("caller", this->caller_args, args, block_ctx);

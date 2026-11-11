@@ -4,11 +4,14 @@
 #include "value.h"
 
 #include <cassert>
+#include <cstdio>
 #include <ctime>
 #include <deque>
+#include <map>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #define JJ_DEBUG(msg, ...)  do { if (g_jinja_debug) printf("%s:%-3d : " msg "\n", FILENAME, __LINE__, __VA_ARGS__); } while (0)
@@ -63,14 +66,8 @@ enum class loop_flow { NONE, BREAK, CONTINUE };
 
 class render_scopes {
   public:
-    ~render_scopes() {
-        closing_ = true;
-        for (auto & frame : frames_) {
-            frame.bindings.clear();
-        }
-    }
-
     scope * acquire(scope * parent) {
+        ensure_active();
         scope * frame;
         if (!free_) {
             frame = &frames_.emplace_back();
@@ -87,7 +84,7 @@ class render_scopes {
     }
 
     void release(scope * frame) {
-        if (closing_) {
+        if (closed_) {
             return;
         }
         while (frame && --frame->references == 0) {
@@ -99,39 +96,57 @@ class render_scopes {
         }
     }
 
-    scope * capture(scope * frame) {
+    scope * snapshot(scope * frame) {
         auto * result = acquire(nullptr);
-        for (; frame; frame = frame->parent) {
-            for (const auto & binding : frame->bindings) {
-                result->bindings.emplace(binding.first, binding.second);
+        try {
+            for (; frame; frame = frame->parent) {
+                for (const auto & binding : frame->bindings) {
+                    result->bindings.emplace(binding.first, binding.second);
+                }
             }
+        } catch (...) {
+            release(result);
+            throw;
         }
         return result;
+    }
+
+    void close() {
+        if (closed_) {
+            return;
+        }
+        closed_ = true;
+        for (auto & frame : frames_) {
+            frame.bindings.clear();
+        }
+    }
+
+    void ensure_active() const {
+        if (closed_) {
+            throw std::runtime_error("Template render has ended");
+        }
     }
 
     loop_flow flow = loop_flow::NONE;
 
   private:
     std::deque<scope> frames_;
-    scope *           free_    = nullptr;
-    bool              closing_ = false;
+    scope *           free_   = nullptr;
+    bool              closed_ = false;
 };
 
 struct context {
-    std::shared_ptr<std::string> src;          // for debugging; use shared_ptr to avoid copying on scope creation
-    std::time_t current_time; // for functions that need current time
-
+    std::shared_ptr<std::string> src;  // shared source for error reporting
+    std::time_t                  current_time;
     bool is_get_stats = false;
-    int macro_depth = 0;
-
+    int                          macro_depth  = 0;
     visitor_fn visitor;
 
-    // src is optional, used for error reporting
     context(std::string src = "") :
         src(std::make_shared<std::string>(std::move(src))),
-        owned_scopes(std::make_unique<render_scopes>()),
-        scopes(owned_scopes.get()) {
-        env = scopes->acquire(nullptr);
+        scopes(std::make_shared<render_scopes>()),
+        env(scopes->acquire(nullptr)),
+        root_(true) {
         set_val("true", mk_val<value_bool>(true));
         set_val("True", mk_val<value_bool>(true));
         set_val("false", mk_val<value_bool>(false));
@@ -141,20 +156,32 @@ struct context {
         current_time = std::time(nullptr);
     }
 
-    ~context() { scopes->release(env); }
+    ~context() {
+        if (root_) {
+            scopes->close();
+        } else if (env) {
+            scopes->release(env);
+        }
+    }
 
-    // Call blocks keep a snapshot of visible bindings until the render ends.
-    scope * capture_scope() const { return scopes->capture(env); }
+    context(const context & parent) : context(parent, parent.scopes->acquire(parent.env)) {}
 
-    context(const context & caller, scope * lexical_scope) :
-        src(caller.src),
-        current_time(caller.current_time),
-        is_get_stats(caller.is_get_stats),
-        macro_depth(caller.macro_depth),
-        scopes(caller.scopes),
-        env(scopes->acquire(lexical_scope)) {}
+    context(context && other) noexcept :
+        src(std::move(other.src)),
+        current_time(other.current_time),
+        is_get_stats(other.is_get_stats),
+        macro_depth(other.macro_depth),
+        visitor(std::move(other.visitor)),
+        scopes(std::move(other.scopes)),
+        env(std::exchange(other.env, nullptr)),
+        root_(std::exchange(other.root_, false)) {}
 
-    context(const context & parent) : context(parent, parent.env) {}
+    context & operator=(const context &) = delete;
+
+    // Caller captures own a detached binding snapshot until the callable is released.
+    context snapshot() const { return context(*this, scopes->snapshot(env)); }
+
+    void ensure_active() const { scopes->ensure_active(); }
 
     value find_val(const std::string & name) {
         for (auto * frame = env; frame; frame = frame->parent) {
@@ -192,9 +219,17 @@ struct context {
     loop_flow & flow() { return scopes->flow; }
 
   private:
-    std::unique_ptr<render_scopes> owned_scopes;
-    render_scopes *                scopes;
+    context(const context & parent, scope * frame) :
+        src(parent.src),
+        current_time(parent.current_time),
+        is_get_stats(parent.is_get_stats),
+        macro_depth(parent.macro_depth),
+        scopes(parent.scopes),
+        env(frame) {}
+
+    std::shared_ptr<render_scopes> scopes;
     scope *                        env;
+    bool                           root_ = false;
 };
 
 // utils for visiting AST nodes
